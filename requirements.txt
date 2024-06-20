@@ -1,9 +1,9 @@
 accelerate
 bitsandbytes
+click
 datasets
 diffusers
 ftfy
-mypy
 torch
 torchvision
 transformers

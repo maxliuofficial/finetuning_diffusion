@@ -28,3 +28,4 @@ venv.bak/
 # Misc
 .lightning_studio/
 .wget-hsts
+output_dir/
