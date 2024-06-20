@@ -1,0 +1,30 @@
+# .gitignore file
+
+# Ignore system files
+.DS_Store
+Thumbs.db
+
+# Ignore Python build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Ignore Python virtual environments
+venv/
+*.venv
+venv.bak/
+
+# Ignore Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Ignore files related to PyCharm
+.idea/
+
+# Ignore files related to VS Code
+.vscode*
+
+# Misc
+.lightning_studio/
+.wget-hsts

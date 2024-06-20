@@ -1,0 +1,9 @@
+accelerate
+bitsandbytes
+datasets
+diffusers
+ftfy
+mypy
+torch
+torchvision
+transformers
