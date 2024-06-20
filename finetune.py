@@ -1,5 +1,6 @@
 import functools
 import math
+import os
 from dataclasses import dataclass
 
 import accelerate.utils
@@ -12,17 +13,15 @@ from accelerate import Accelerator
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
-    PNDMScheduler,
     StableDiffusionPipeline,
     UNet2DConditionModel,
 )
-from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
+from peft import LoraConfig
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
-from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer
+from transformers import CLIPTextModel, CLIPTokenizer
 
-MODEL_ID = "CompVis/stable-diffusion-v1-4"
 OUTPUT_BASEDIR = "output_dir"
 
 
@@ -68,20 +67,31 @@ class TrainingArgs:
     instance_prompt: str
     learning_rate: float = 2e-06
     max_train_steps: int = 400
-    train_batch_size: int = 1
+    train_batch_size: int = 2
     gradient_accumulation_steps: int = 1  # Increase to save memory
     max_grad_norm: float = 1.0
     gradient_checkpointing: bool = True  # True to save memory
     use_8bit_adam: bool = True  # Use 8bit optimizer from bitsandbytes
     seed: int = 1000101
     sample_batch_size: int = 2
-    resolution: int = 512  # Reduce to save memory
 
 
 def build_instance_prompt(name: str, typ: str) -> str:
     instance_prompt = f"a photo of {name} {typ}"
     print(f"Instance prompt: {instance_prompt}")
     return instance_prompt
+
+
+def get_modules_for_lora(diffusion_pipe: StableDiffusionPipeline) -> list[str]:
+    return [
+        name
+        for name, module in diffusion_pipe.unet.named_modules()
+        # Only these are supported for lora
+        if isinstance(
+            module,
+            (torch.nn.Conv2d, torch.nn.Linear, torch.nn.Conv1d, torch.nn.Embedding),
+        )
+    ]
 
 
 def collate(
@@ -103,18 +113,24 @@ def collate(
 def train_model(
     training_args: TrainingArgs,
     dataset: datasets.Dataset,
-    tokenizer: CLIPTokenizer,
-    text_encoder: CLIPTextModel,
-    vae: AutoencoderKL,
-    unet: UNet2DConditionModel,
+    diffusion_pipe: StableDiffusionPipeline,
+    lora_config: LoraConfig | None = None,
 ) -> UNet2DConditionModel:
     accelerator = Accelerator(
         gradient_accumulation_steps=training_args.gradient_accumulation_steps,
     )
     print(f"Training on {accelerator.device}.")
     accelerate.utils.set_seed(training_args.seed)
+
+    unet: UNet2DConditionModel = diffusion_pipe.unet
+
     if training_args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
+
+    trainable_params = unet.parameters()
+    if lora_config is not None:
+        unet.add_adapter(lora_config)
+        trainable_params = filter(lambda p: p.requires_grad, unet.parameters())
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
     if training_args.use_8bit_adam:
@@ -125,7 +141,7 @@ def train_model(
         optimizer_class = torch.optim.AdamW
 
     optimizer = optimizer_class(
-        unet.parameters(),
+        trainable_params,
         lr=training_args.learning_rate,
     )
 
@@ -136,6 +152,7 @@ def train_model(
         num_train_timesteps=1000,
     )
 
+    tokenizer: CLIPTokenizer = diffusion_pipe.tokenizer
     train_dataloader = DataLoader(
         dataset=TorchDataset(dataset, training_args.instance_prompt, tokenizer),
         batch_size=training_args.train_batch_size,
@@ -151,7 +168,9 @@ def train_model(
     assert isinstance(optimizer, torch.optim.Optimizer)
 
     # Move text_encode and vae to gpu
+    text_encoder: CLIPTextModel = diffusion_pipe.text_encoder
     text_encoder.to(accelerator.device)
+    vae: AutoencoderKL = diffusion_pipe.vae
     vae.to(accelerator.device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed
@@ -235,32 +254,13 @@ def train_model(
 
 def save_pipeline(
     output_dir: str,
-    tokenizer: CLIPTokenizer,
-    text_encoder: CLIPTextModel,
-    vae: AutoencoderKL,
+    diffusion_pipe: StableDiffusionPipeline,
     unet: UNet2DConditionModel,
-    safety_checker: StableDiffusionSafetyChecker,
-    feature_extractor: CLIPFeatureExtractor,
 ) -> None:
     # Create the pipeline using the trained modules and save it
     print(f"Saving to {output_dir}.")
-    scheduler = PNDMScheduler(
-        beta_start=0.00085,
-        beta_end=0.012,
-        beta_schedule="scaled_linear",
-        skip_prk_steps=True,
-        steps_offset=1,
-    )
-    pipeline = StableDiffusionPipeline(
-        text_encoder=text_encoder,
-        vae=vae,
-        unet=unet,
-        tokenizer=tokenizer,
-        scheduler=scheduler,
-        safety_checker=safety_checker,
-        feature_extractor=feature_extractor,
-    )
-    pipeline.save_pretrained(output_dir)
+    diffusion_pipe.unet = unet
+    diffusion_pipe.save_pretrained(output_dir)
 
 
 @click.command()
@@ -268,47 +268,31 @@ def save_pipeline(
 @click.option("--name", required=True)
 @click.option("--typ", required=True)
 @click.option("--output-dir", required=True)
-def main(dataset: str, name: str, typ: str, output_dir: str):
+@click.option("--use-lora", is_flag=True, default=False)
+def main(dataset: str, name: str, typ: str, output_dir: str, use_lora: bool):
     dataset = datasets.load_dataset(dataset, split="train")
     instance_prompt = build_instance_prompt(name, typ)
 
     training_args = TrainingArgs(instance_prompt=instance_prompt)
 
-    # The Stable Diffusion checkpoint we'll fine-tune
-    tokenizer = CLIPTokenizer.from_pretrained(
-        MODEL_ID,
-        subfolder="tokenizer",
-    )
-    text_encoder = CLIPTextModel.from_pretrained(MODEL_ID, subfolder="text_encoder")
-    vae = AutoencoderKL.from_pretrained(MODEL_ID, subfolder="vae")
-    unet = UNet2DConditionModel.from_pretrained(MODEL_ID, subfolder="unet")
-
-    feature_extractor = CLIPFeatureExtractor.from_pretrained(
-        "openai/clip-vit-base-patch32"
-    )
-    safety_checker = StableDiffusionSafetyChecker.from_pretrained(
-        "CompVis/stable-diffusion-safety-checker"
+    diffusion_pipe = StableDiffusionPipeline.from_pretrained(
+        "runwayml/stable-diffusion-v1-5", token=os.getenv("hf_token")
     )
 
-    trained_unet = train_model(
-        training_args,
-        dataset,
-        tokenizer,
-        text_encoder,
-        vae,
-        unet,
-    )
+    lora_config = None
+    if use_lora:
+        lora_config = LoraConfig(
+            r=8,
+            lora_alpha=4,
+            init_lora_weights="gaussian",
+            target_modules=get_modules_for_lora(diffusion_pipe),
+            # lora_dropout=0.1,  # TODO: try this out?
+        )
+
+    finetuned_unet = train_model(training_args, dataset, diffusion_pipe, lora_config)
 
     output_dir = f"{OUTPUT_BASEDIR}/{output_dir}"
-    save_pipeline(
-        output_dir,
-        tokenizer,
-        text_encoder,
-        vae,
-        trained_unet,
-        safety_checker,
-        feature_extractor,
-    )
+    save_pipeline(output_dir, diffusion_pipe, finetuned_unet)
 
     print(f"Finished!")
 

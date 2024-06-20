@@ -4,6 +4,7 @@ click
 datasets
 diffusers
 ftfy
+peft
 torch
 torchvision
 transformers
