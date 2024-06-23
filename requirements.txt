@@ -4,7 +4,10 @@ click
 datasets
 diffusers
 ftfy
+ipywidgets
 peft
+protobuf
+sentencepiece
 torch
 torchvision
 transformers
